@@ -1,2 +1,6 @@
 venv/
 .env
+regulations/
+# OS-specific files
+.DS_Store
+.DS_Store?
