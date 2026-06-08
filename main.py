@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from cost import query_cost_inr
 import chromadb
 
 # Load API key from .env
@@ -57,9 +58,14 @@ def ask(question: Question):
             }
         ],
     )
+    
+
+    cost_inr = query_cost_inr(response.usage.input_tokens,response.usage.output_tokens)
+    print(f"[cost] in={response.usage.input_tokens}  out={response.usage.output_tokens}  ≈ ₹{cost_inr:.4f}")
 
     # 5. RETURN — the answer plus which chunks we used (proof, and handy for debugging).
     return {
         "answer": response.content[0].text,
         "sources": [f"{m['source']} (page {m['page']})" for m in metas],
+        "cost_inr": round(cost_inr, 4),
     }
