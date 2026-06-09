@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from cost import query_cost_inr
-from calculator import calculate_obligation   # <-- NEW: import the proven function
+from calculator import calculate_obligation
 import chromadb
 
 load_dotenv()
@@ -11,10 +11,15 @@ load_dotenv()
 app = FastAPI()
 client = Anthropic()
 
+# ── A: STARTUP ────────────────────────────────────────────────────────────────
+# Open ChromaDB once at startup, not per request.
 chroma_client = chromadb.PersistentClient(path="chroma_db")
 collection = chroma_client.get_collection("epr_regulations")
 
-# <-- NEW: the tool schema (the "menu card") and the dispatcher.
+
+# ── B: TOOLS SCHEMA + DISPATCHER ─────────────────────────────────────────────
+# TOOLS is the "menu card" — the only way Claude learns a tool exists.
+# Claude can't see our Python code; this schema is the entire interface.
 TOOLS = [
     {
         "name": "calculate_obligation",
@@ -35,7 +40,11 @@ TOOLS = [
     }
 ]
 
+
 def run_tool(tool_name, tool_input):
+    """Route Claude's tool request to the real Python function.
+    The name-match is for our code — it's a string comparison, not magic.
+    Adding a new tool = one more 'if' block here."""
     if tool_name == "calculate_obligation":
         return calculate_obligation(
             tonnage=tool_input["tonnage"],
@@ -45,13 +54,16 @@ def run_tool(tool_name, tool_input):
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
+# ── C: REQUEST MODEL ──────────────────────────────────────────────────────────
 class Question(BaseModel):
     text: str
 
 
+# ── D + E + F: THE ENDPOINT ───────────────────────────────────────────────────
 @app.post("/ask")
 def ask(question: Question):
-    # 1. RETRIEVE — unchanged.
+
+    # D: RETRIEVE — find the 3 nearest regulation chunks
     results = collection.query(
         query_texts=[question.text],
         n_results=3,
@@ -59,23 +71,23 @@ def ask(question: Question):
     docs = results["documents"][0]
     metas = results["metadatas"][0]
 
-    # 2. BUILD CONTEXT — unchanged.
+    # Build the context block Claude will read
     context = ""
     for doc, meta in zip(docs, metas):
         context += f"[Source: {meta['source']}, page {meta['page']}]\n{doc}\n\n"
 
-    # 3. THE RULES — unchanged, but with ONE added sentence about the calculator.
+    # Standing rules — sent every API call (Claude has no memory)
     system_prompt = (
         "You are an EPR compliance assistant. Answer using ONLY the regulation "
         "excerpts provided. Cite the source and page for every fact, like "
         "(EPR Guidelines 2022, page 27). If the excerpts do not contain the answer, "
         "say you don't know — do not guess or use outside knowledge. "
         "If a question requires calculating an obligation amount, use the "
-        "calculate_obligation tool — never do the arithmetic yourself."   # <-- NEW sentence
+        "calculate_obligation tool — never do the arithmetic yourself."
     )
 
-    # 4. ASK CLAUDE — now the back-and-forth lives in a `messages` list we can grow,
-    #    and we offer the tool with tools=TOOLS.
+    # The conversation history — starts with the user's question + chunks.
+    # This list grows each agent lap; the full history is resent every call.
     messages = [
         {
             "role": "user",
@@ -83,40 +95,49 @@ def ask(question: Question):
         }
     ]
 
-    # <-- NEW: track token totals across BOTH calls (was a single call before).
+    # Token counters — summed across all laps for the true cost
     total_in = 0
     total_out = 0
 
-    # ---- CALL 1 ----
+    # E: AGENT LOOP ─────────────────────────────────────────────────────────
+    # Call 1 — always happens. Claude sees question + chunks + tools menu.
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=system_prompt,
-        tools=TOOLS,                 # <-- NEW: offer the calculator
+        tools=TOOLS,
         messages=messages,
     )
-    total_in += response.usage.input_tokens
+    total_in  += response.usage.input_tokens
     total_out += response.usage.output_tokens
 
-    used_tool = False               # <-- NEW: remember whether the calculator ran
+    used_tool = False
 
-    # <-- NEW: the handshake loop — only runs if Claude asked for the tool.
-    if response.stop_reason == "tool_use":
+    # Safety cap — never burn more than MAX_LAPS tool calls per request.
+    # Without this, a confused model could loop forever and cost a lot.
+    MAX_LAPS = 5
+    laps = 0
+
+    while response.stop_reason == "tool_use" and laps < MAX_LAPS:
         used_tool = True
+
+        # Find the tool_use block inside Claude's reply
         tool_use = next(b for b in response.content if b.type == "tool_use")
         result = run_tool(tool_use.name, tool_use.input)
 
+        # Grow the messages list.
+        # Claude has no memory — we must resend the full history every lap.
         messages.append({"role": "assistant", "content": response.content})
         messages.append({
             "role": "user",
             "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_use.id,
+                "tool_use_id": tool_use.id,   # staples result to the request
                 "content": str(result),
             }],
         })
 
-        # ---- CALL 2 ----
+        # Next call — resends the whole growing messages list
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
@@ -124,18 +145,21 @@ def ask(question: Question):
             tools=TOOLS,
             messages=messages,
         )
-        total_in += response.usage.input_tokens
+        total_in  += response.usage.input_tokens
         total_out += response.usage.output_tokens
 
-    # COST — now summed across however many calls happened.
-    cost_inr = query_cost_inr(total_in, total_out)
-    print(f"[cost] in={total_in}  out={total_out}  tool_used={used_tool}  ≈ ₹{cost_inr:.4f}")
+        laps += 1   # increment AFTER the call; laps = calls made so far
+        print(f"[agent] lap {laps} done — stop_reason={response.stop_reason}")
 
-    # 5. RETURN — sources only when no tool was used (a pure-math answer
-    #    didn't lean on the chunks, so listing them would be misleading).
+    # Loop exits when stop_reason == "end_turn"  OR  laps hits MAX_LAPS
+
+    # F: RETURN ─────────────────────────────────────────────────────────────
+    cost_inr = query_cost_inr(total_in, total_out)
+    print(f"[cost] in={total_in}  out={total_out}  tool_used={used_tool}  laps={laps}  ≈ ₹{cost_inr:.4f}")
+
     return {
-        "answer": response.content[0].text,
-        "sources": [] if used_tool else [f"{m['source']} (page {m['page']})" for m in metas],
-        "cost_inr": round(cost_inr, 4),
-        "tool_used": used_tool,      # <-- NEW: handy for debugging/demo
+        "answer":    response.content[0].text,
+        "sources":   [] if used_tool else [f"{m['source']} (page {m['page']})" for m in metas],
+        "cost_inr":  round(cost_inr, 4),
+        "tool_used": used_tool,
     }
