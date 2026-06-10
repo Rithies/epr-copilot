@@ -4,6 +4,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from cost import query_cost_inr
 from calculator import calculate_obligation
+from discrepancy import run_all_checks          # NEW: import the proven checks
 import chromadb
 
 load_dotenv()
@@ -11,15 +12,13 @@ load_dotenv()
 app = FastAPI()
 client = Anthropic()
 
-# ── A: STARTUP ────────────────────────────────────────────────────────────────
-# Open ChromaDB once at startup, not per request.
+# -- A: STARTUP ---------------------------------------------------------------
 chroma_client = chromadb.PersistentClient(path="chroma_db")
 collection = chroma_client.get_collection("epr_regulations")
 
 
-# ── B: TOOLS SCHEMA + DISPATCHER ─────────────────────────────────────────────
-# TOOLS is the "menu card" — the only way Claude learns a tool exists.
-# Claude can't see our Python code; this schema is the entire interface.
+# -- B: TOOLS SCHEMA + DISPATCHER ---------------------------------------------
+# Two tools now. Claude reads these and decides which (if any) to call.
 TOOLS = [
     {
         "name": "calculate_obligation",
@@ -37,33 +36,74 @@ TOOLS = [
             },
             "required": ["tonnage", "category", "year"],
         },
-    }
+    },
+    {
+        # NEW TOOL -- the headline capability.
+        "name": "check_recycling_claim",
+        "description": (
+            "Check whether a recycling claim is plausible by running deterministic "
+            "discrepancy checks (capacity, material balance, cross-document dates). "
+            "Use this whenever the user asks to verify, validate, or assess whether "
+            "a recycling claim or certificate is genuine or suspicious. Returns a "
+            "structured verdict -- do NOT judge plausibility yourself; rely on the tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recycler_id":           {"type": "string", "description": "The recycler's ID, e.g. REC-042."},
+                "registered_capacity_t": {"type": "number", "description": "Registered/installed capacity in tonnes."},
+                "claimed_recycled_t":    {"type": "number", "description": "Tonnes the recycler claims to have recycled."},
+                "input_t":               {"type": "number", "description": "Tonnes of waste received as input."},
+                "output_t":              {"type": "number", "description": "Tonnes of recyclate produced as output."},
+                "cert_year":             {"type": "number", "description": "Year the certificate was issued."},
+                "registration_year":    {"type": "number", "description": "Year the recycler was registered."},
+            },
+            "required": [
+                "recycler_id", "registered_capacity_t", "claimed_recycled_t",
+                "input_t", "output_t", "cert_year", "registration_year",
+            ],
+        },
+    },
 ]
 
 
 def run_tool(tool_name, tool_input):
     """Route Claude's tool request to the real Python function.
-    The name-match is for our code — it's a string comparison, not magic.
-    Adding a new tool = one more 'if' block here."""
+    Adding a tool = one more 'if' block. No rewrite."""
     if tool_name == "calculate_obligation":
         return calculate_obligation(
             tonnage=tool_input["tonnage"],
             category=tool_input["category"],
             year=tool_input["year"],
         )
+    if tool_name == "check_recycling_claim":        # NEW: route to discrepancy checks
+        return run_all_checks(tool_input)            # tool_input IS the claim packet (a dict)
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
-# ── C: REQUEST MODEL ──────────────────────────────────────────────────────────
+# -- C: REQUEST MODELS --------------------------------------------------------
 class Question(BaseModel):
     text: str
 
 
-# ── D + E + F: THE ENDPOINT ───────────────────────────────────────────────────
+# NEW: the structured claim packet for the production /check-claim door.
+# FastAPI validates every field's type before our code ever runs -- if a
+# number is missing or the wrong type, the request is rejected automatically.
+class ClaimPacket(BaseModel):
+    recycler_id: str
+    registered_capacity_t: float
+    claimed_recycled_t: float
+    input_t: float
+    output_t: float
+    cert_year: int
+    registration_year: int
+
+
+# -- D + E + F: THE ENDPOINT --------------------------------------------------
 @app.post("/ask")
 def ask(question: Question):
 
-    # D: RETRIEVE — find the 3 nearest regulation chunks
+    # D: RETRIEVE -- unchanged.
     results = collection.query(
         query_texts=[question.text],
         n_results=3,
@@ -71,23 +111,24 @@ def ask(question: Question):
     docs = results["documents"][0]
     metas = results["metadatas"][0]
 
-    # Build the context block Claude will read
     context = ""
     for doc, meta in zip(docs, metas):
         context += f"[Source: {meta['source']}, page {meta['page']}]\n{doc}\n\n"
 
-    # Standing rules — sent every API call (Claude has no memory)
+    # Standing rules -- one more sentence about the discrepancy tool.
     system_prompt = (
         "You are an EPR compliance assistant. Answer using ONLY the regulation "
         "excerpts provided. Cite the source and page for every fact, like "
         "(EPR Guidelines 2022, page 27). If the excerpts do not contain the answer, "
-        "say you don't know — do not guess or use outside knowledge. "
+        "say you don't know -- do not guess or use outside knowledge. "
         "If a question requires calculating an obligation amount, use the "
-        "calculate_obligation tool — never do the arithmetic yourself."
+        "calculate_obligation tool -- never do the arithmetic yourself. "
+        "If the user asks whether a recycling claim is plausible or genuine, use "
+        "the check_recycling_claim tool -- never judge plausibility yourself. "
+        "When a tool returns a verdict, explain which checks fired and why, in "
+        "plain language."
     )
 
-    # The conversation history — starts with the user's question + chunks.
-    # This list grows each agent lap; the full history is resent every call.
     messages = [
         {
             "role": "user",
@@ -95,12 +136,10 @@ def ask(question: Question):
         }
     ]
 
-    # Token counters — summed across all laps for the true cost
     total_in = 0
     total_out = 0
 
-    # E: AGENT LOOP ─────────────────────────────────────────────────────────
-    # Call 1 — always happens. Claude sees question + chunks + tools menu.
+    # E: AGENT LOOP -- unchanged from Phase 4 Half A.
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
@@ -112,32 +151,25 @@ def ask(question: Question):
     total_out += response.usage.output_tokens
 
     used_tool = False
-
-    # Safety cap — never burn more than MAX_LAPS tool calls per request.
-    # Without this, a confused model could loop forever and cost a lot.
     MAX_LAPS = 5
     laps = 0
 
     while response.stop_reason == "tool_use" and laps < MAX_LAPS:
         used_tool = True
 
-        # Find the tool_use block inside Claude's reply
         tool_use = next(b for b in response.content if b.type == "tool_use")
         result = run_tool(tool_use.name, tool_use.input)
 
-        # Grow the messages list.
-        # Claude has no memory — we must resend the full history every lap.
         messages.append({"role": "assistant", "content": response.content})
         messages.append({
             "role": "user",
             "content": [{
                 "type": "tool_result",
-                "tool_use_id": tool_use.id,   # staples result to the request
+                "tool_use_id": tool_use.id,
                 "content": str(result),
             }],
         })
 
-        # Next call — resends the whole growing messages list
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
@@ -148,14 +180,12 @@ def ask(question: Question):
         total_in  += response.usage.input_tokens
         total_out += response.usage.output_tokens
 
-        laps += 1   # increment AFTER the call; laps = calls made so far
-        print(f"[agent] lap {laps} done — stop_reason={response.stop_reason}")
+        laps += 1
+        print(f"[agent] lap {laps} done -- stop_reason={response.stop_reason}")
 
-    # Loop exits when stop_reason == "end_turn"  OR  laps hits MAX_LAPS
-
-    # F: RETURN ─────────────────────────────────────────────────────────────
+    # F: RETURN -- unchanged.
     cost_inr = query_cost_inr(total_in, total_out)
-    print(f"[cost] in={total_in}  out={total_out}  tool_used={used_tool}  laps={laps}  ≈ ₹{cost_inr:.4f}")
+    print(f"[cost] in={total_in}  out={total_out}  tool_used={used_tool}  laps={laps}  approx Rs {cost_inr:.4f}")
 
     return {
         "answer":    response.content[0].text,
@@ -163,3 +193,15 @@ def ask(question: Question):
         "cost_inr":  round(cost_inr, 4),
         "tool_used": used_tool,
     }
+
+
+# -- G: PRODUCTION DOOR (Option B) --------------------------------------------
+# Structured packet in -> deterministic verdict out. Claude is NOT involved.
+# This is the trust-boundary-correct path: the flag comes only from code.
+@app.post("/check-claim")
+def check_claim(packet: ClaimPacket):
+    # packet.dict() turns the validated Pydantic model into a plain dict,
+    # which is exactly the shape run_all_checks expects.
+    verdict = run_all_checks(packet.dict())
+    print(f"[check-claim] {verdict['recycler_id']} -> {verdict['status']} {verdict['checks_fired']}")
+    return verdict
