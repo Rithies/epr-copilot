@@ -5,3 +5,5 @@ regulations/
 .DS_Store
 .DS_Store?
 chroma_db/
+
+onnx_model/
