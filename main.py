@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse   # NEW: lets us serve the HTML page
 from pydantic import BaseModel
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -10,6 +12,15 @@ import chromadb
 load_dotenv()
 
 app = FastAPI()
+# CORS: tell the browser which origins are allowed to call this API.
+# Without this, a page opened from file:// or another domain gets
+# "Failed to fetch" — the browser blocks the request before it's sent.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # "*" = allow any origin. Fine for a demo.
+    allow_methods=["*"],      # allow POST, GET, etc.
+    allow_headers=["*"],      # allow the Content-Type header we send.
+)
 client = Anthropic()
 
 # -- A: STARTUP ---------------------------------------------------------------
@@ -97,6 +108,16 @@ class ClaimPacket(BaseModel):
     output_t: float
     cert_year: int
     registration_year: int
+
+
+# -- ROOT: SERVE THE UI -------------------------------------------------------
+# When someone visits the bare URL (a GET request to "/"), hand the browser
+# the index.html page instead of a "Not Found". Because the UI is now served
+# by this same app, the page and the API share one origin -- so the browser
+# makes no cross-origin call and CORS stops being load-bearing.
+@app.get("/")
+def home():
+    return FileResponse("index.html")
 
 
 # -- D + E + F: THE ENDPOINT --------------------------------------------------
